@@ -10,10 +10,12 @@ Run:  pythonw app.py      (or:  python app.py)
 
 import os
 import sys
+import ctypes
 import json
 import copy
 import queue
 import threading
+import tkinter as tk
 import winreg
 
 import customtkinter as ctk
@@ -28,30 +30,89 @@ RUN_NAME = "NvColorToggler"
 APPDIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NvColorToggler")
 CONFIG_PATH = os.path.join(APPDIR, "config.json")
 
+GAMMA_INFO = ("Gamma is written to the GPU's colour LUT, so it changes the "
+              "picture but will NOT show up on the NVIDIA Control Panel's gamma "
+              "slider — the Control Panel keeps its own stored number and never "
+              "reads the LUT back. Digital Vibrance is different: it's a real "
+              "driver setting the Control Panel shares, so that one does match. "
+              "Use the LIVE readout above to see the true current gamma.")
+
+
+def resource_path(name):
+    """Path to a bundled asset, whether running from source or a PyInstaller exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+ICON_PNG = resource_path("icon.png")
+ICON_ICO = resource_path("icon.ico")
+
+# Win32 for a crisp window/taskbar icon (no Pillow/ImageTk, which is flaky in
+# a frozen exe). restype/argtypes matter on 64-bit so handles aren't truncated.
+_user32 = ctypes.windll.user32
+_user32.LoadImageW.restype = ctypes.c_void_p
+_user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+_user32.SendMessageW.restype = ctypes.c_void_p
+_user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                 ctypes.c_void_p, ctypes.c_void_p]
+_user32.GetParent.restype = ctypes.c_void_p
+_user32.GetParent.argtypes = [ctypes.c_void_p]
+_user32.GetSystemMetrics.restype = ctypes.c_int
+_user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+
+DEFAULT_NAME = "User Default"      # the pinned, undeletable default profile
+
 DEFAULT_CONFIG = {
     "profiles": [
-        {"name": "Default", "vibrance": 50,  "gamma": 1.00, "hotkey": "ctrl+alt+0"},
-        {"name": "Gaming",  "vibrance": 100, "gamma": 1.00, "hotkey": "ctrl+alt+1"},
-        {"name": "Movie",   "vibrance": 65,  "gamma": 1.15, "hotkey": "ctrl+alt+2"},
+        {"name": DEFAULT_NAME, "vibrance": 50, "gamma": 1.00, "hotkey": "ctrl+alt+0", "locked": True},
+        {"name": "Gaming",     "vibrance": 65, "gamma": 1.20, "hotkey": "ctrl+alt+1"},
+        {"name": "Movie",      "vibrance": 58, "gamma": 1.00, "hotkey": "ctrl+alt+2"},
     ],
-    "settings": {"apply_on_startup": True, "last_profile": "Default"},
+    "settings": {"apply_on_startup": True, "last_profile": DEFAULT_NAME},
 }
 
 # --------------------------------------------------------------------------- #
 #  Config
 # --------------------------------------------------------------------------- #
 
+def _ensure_default_profile(cfg):
+    """Guarantee exactly one locked 'User Default' profile, pinned first.
+    Seeds it from NVIDIA defaults (50 / 1.0); migrates an old 'Default' profile."""
+    profiles = cfg.setdefault("profiles", [])
+    locked = [p for p in profiles if p.get("locked")]
+    if locked:
+        default = locked[0]
+        for extra in locked[1:]:            # collapse any accidental duplicates
+            extra["locked"] = False
+    else:
+        default = next((p for p in profiles if p.get("name") == "Default"), None)
+        if default is None:                 # create a fresh one
+            default = {"name": DEFAULT_NAME, "vibrance": 50, "gamma": 1.00,
+                       "hotkey": "", "locked": True}
+            profiles.insert(0, default)
+        else:                               # migrate legacy "Default"
+            default["locked"] = True
+        default["name"] = DEFAULT_NAME
+    if profiles and profiles[0] is not default:   # keep it pinned first
+        profiles.remove(default)
+        profiles.insert(0, default)
+
+    settings = cfg.setdefault("settings", {})
+    settings.setdefault("apply_on_startup", True)
+    names = [p["name"] for p in profiles]
+    if settings.get("last_profile") not in names:   # heal renamed/removed ref
+        settings["last_profile"] = DEFAULT_NAME
+    return cfg
+
+
 def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        data.setdefault("profiles", [])
-        data.setdefault("settings", {})
-        data["settings"].setdefault("apply_on_startup", True)
-        data["settings"].setdefault("last_profile", None)
-        return data
     except Exception:
-        return copy.deepcopy(DEFAULT_CONFIG)
+        data = copy.deepcopy(DEFAULT_CONFIG)
+    return _ensure_default_profile(data)
 
 
 def save_config(cfg):
@@ -148,18 +209,6 @@ def apply_profile(name, notify=True):
             pass
 
 
-def reset_default():
-    apply_values(50, 1.0)
-    CONFIG["settings"]["last_profile"] = None      # no profile is active now
-    save_config(CONFIG)
-    refresh_tray()                                 # clears the radio dot
-    if icon is not None:
-        try:
-            icon.notify("Vibrance 50% · Gamma 1.00", "Reset to NVIDIA default")
-        except Exception:
-            pass
-
-
 def reapply_current(notify=True):
     """Re-assert the active profile (mainly to restore gamma after a game,
     sleep/wake, or the NVIDIA Control Panel reset the GPU LUT)."""
@@ -199,6 +248,11 @@ def poll_queue():
 # --------------------------------------------------------------------------- #
 
 def make_icon():
+    try:
+        return Image.open(ICON_PNG).convert("RGBA").resize((64, 64), Image.LANCZOS)
+    except Exception:
+        pass
+    # Fallback if icon.png is missing: a simple colour wheel.
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     box = (8, 8, 56, 56)
@@ -241,7 +295,6 @@ def build_menu():
     items += [
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Re-apply current profile", lambda i, item: reapply_current()),
-        pystray.MenuItem("Reset to NVIDIA default", lambda i, item: reset_default()),
         pystray.MenuItem("Settings…", lambda i, item: queue_gui(show_settings), default=True),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", lambda i, item: quit_app()),
@@ -298,6 +351,34 @@ _KEYSYM_TOKENS = {
 }
 
 
+class Tooltip:
+    """Lightweight hover tooltip for any tk/ctk widget."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _=None):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 22
+        y = self.widget.winfo_rooty() + 22
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, justify="left", bg="#202024",
+                 fg="#e6e6e6", relief="solid", borderwidth=1, wraplength=300,
+                 padx=10, pady=8, font=("Segoe UI", 9)).pack()
+
+    def _hide(self, _=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
 class SettingsUI:
     def __init__(self, master):
         self.root = master
@@ -313,6 +394,10 @@ class SettingsUI:
         self.root.title(APP_NAME)
         self.root.geometry("580x640")
         self.root.minsize(540, 500)
+        self._apply_window_icon()
+        # customtkinter re-stamps the window icon shortly after init; re-apply
+        # so ours wins and the taskbar icon stays crisp.
+        self.root.after(300, self._apply_window_icon)
 
         ctk.CTkLabel(self.root, text="Colour Profiles",
                      font=ctk.CTkFont(size=20, weight="bold")).pack(padx=22, pady=(18, 2), anchor="w")
@@ -354,6 +439,34 @@ class SettingsUI:
         self.root.bind("<KeyRelease>", self._on_key_release)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
 
+    def _apply_window_icon(self):
+        """Set the titlebar + taskbar icon to icon.ico.
+
+        iconbitmap() flips customtkinter's internal flag so it stops stamping its
+        own default icon over ours. WM_SETICON then sets a correctly sized large
+        icon straight from the .ico for a crisp (non-blurry) taskbar button."""
+        try:
+            self.root.iconbitmap(ICON_ICO)
+        except Exception:
+            pass
+        try:
+            IMAGE_ICON, LR_LOADFROMFILE = 1, 0x0010
+            WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+            cxs, cys = _user32.GetSystemMetrics(49), _user32.GetSystemMetrics(50)   # small icon
+            cxb, cyb = _user32.GetSystemMetrics(11), _user32.GetSystemMetrics(12)   # large icon
+            h_small = _user32.LoadImageW(None, ICON_ICO, IMAGE_ICON, cxs, cys, LR_LOADFROMFILE)
+            h_big = _user32.LoadImageW(None, ICON_ICO, IMAGE_ICON, cxb, cyb, LR_LOADFROMFILE)
+            wid = self.root.winfo_id()
+            for hwnd in (wid, _user32.GetParent(wid)):
+                if not hwnd:
+                    continue
+                if h_small:
+                    _user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_small)
+                if h_big:
+                    _user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, h_big)
+        except Exception:
+            pass
+
     # -- data <-> widgets ------------------------------------------------- #
     def load(self):
         self.profiles = copy.deepcopy(CONFIG["profiles"])
@@ -386,13 +499,20 @@ class SettingsUI:
         card = ctk.CTkFrame(self.list_frame)
         card.pack(fill="x", pady=6, padx=4)
 
+        locked = p.get("locked", False)
         top = ctk.CTkFrame(card, fg_color="transparent")
         top.pack(fill="x", padx=12, pady=(12, 2))
         name = ctk.StringVar(value=p["name"])
-        ctk.CTkEntry(top, textvariable=name, width=210,
-                     placeholder_text="Profile name").pack(side="left")
-        ctk.CTkButton(top, text="Delete", width=64, fg_color="#933", hover_color="#b44",
-                      command=lambda idx=i: self.delete(idx)).pack(side="right")
+        if locked:
+            ctk.CTkEntry(top, textvariable=name, width=210,
+                         state="disabled").pack(side="left")
+            ctk.CTkLabel(top, text="your default · can't be deleted",
+                         text_color="gray55").pack(side="left", padx=10)
+        else:
+            ctk.CTkEntry(top, textvariable=name, width=210,
+                         placeholder_text="Profile name").pack(side="left")
+            ctk.CTkButton(top, text="Delete", width=64, fg_color="#933", hover_color="#b44",
+                          command=lambda idx=i: self.delete(idx)).pack(side="right")
         ctk.CTkButton(top, text="Apply", width=64,
                       command=lambda idx=i: self.apply_now(idx)).pack(side="right", padx=(0, 6))
 
@@ -407,8 +527,12 @@ class SettingsUI:
 
         grow = ctk.CTkFrame(card, fg_color="transparent")
         grow.pack(fill="x", padx=12, pady=2)
-        glbl = ctk.CTkLabel(grow, text=f"Gamma     {p['gamma']:.2f}", width=140, anchor="w")
+        glbl = ctk.CTkLabel(grow, text=f"Gamma     {p['gamma']:.2f}", width=118, anchor="w")
         glbl.pack(side="left")
+        ginfo = ctk.CTkLabel(grow, text="ⓘ", width=22, text_color="#6ea8ff",
+                             cursor="hand2", font=ctk.CTkFont(size=15))
+        ginfo.pack(side="left")
+        Tooltip(ginfo, GAMMA_INFO)
         gam = ctk.CTkSlider(grow, from_=0.30, to=2.80, number_of_steps=250,
                             command=lambda v, l=glbl: l.configure(text=f"Gamma     {float(v):.2f}"))
         gam.set(p["gamma"])
@@ -434,6 +558,8 @@ class SettingsUI:
         self._render()
 
     def delete(self, idx):
+        if self.profiles[idx].get("locked"):     # User Default can't be removed
+            return
         self._commit_widgets()
         del self.profiles[idx]
         self._render()
@@ -472,8 +598,7 @@ class SettingsUI:
 
         CONFIG["profiles"] = copy.deepcopy(self.profiles)
         CONFIG["settings"]["apply_on_startup"] = bool(self.var_apply_startup.get())
-        if CONFIG["settings"].get("last_profile") not in names:
-            CONFIG["settings"]["last_profile"] = names[0] if names else None
+        _ensure_default_profile(CONFIG)          # keep User Default pinned & valid
         save_config(CONFIG)
         set_run_at_startup(bool(self.var_run_startup.get()))
         hotkeys.set_bindings(current_bindings())
@@ -558,12 +683,20 @@ class SettingsUI:
 def show_settings():
     ui.load()                          # reads live values into the readout
     root.deiconify()
+    ui._apply_window_icon()            # taskbar button appears on show; set its icon
     root.lift()
     root.focus_force()
 
 
 def main():
     global root, ui, hotkeys
+
+    # Give the process its own taskbar identity so Windows shows our icon
+    # (crisp) instead of the pythonw.exe host icon.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NvColorToggler.App")
+    except Exception:
+        pass
 
     first_run = not os.path.exists(CONFIG_PATH)
     if first_run:
