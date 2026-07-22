@@ -19,8 +19,25 @@ import tkinter as tk
 import winreg
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw
+from PIL import Image
 import pystray
+
+try:
+    # customtkinter runs two loops that reschedule themselves forever, for as
+    # long as any window exists — even a hidden one. Between them they were
+    # responsible for effectively all of this app's CPU usage:
+    #   * a system dark/light theme check, 33 times a second
+    #   * a display DPI check, 10 times a second
+    # We hard-code dark mode, and every window reads its monitor's DPI when it is
+    # created, so neither loop has anything useful left to do. Flagging them as
+    # already running means customtkinter never schedules them at all.
+    from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
+    from customtkinter.windows.widgets.appearance_mode.appearance_mode_tracker import (
+        AppearanceModeTracker)
+    ScalingTracker.update_loop_running = True
+    AppearanceModeTracker.update_loop_running = True
+except Exception:
+    pass
 
 import nvcolor
 from hotkeys import HotkeyManager, parse_hotkey
@@ -227,21 +244,38 @@ def reapply_current(notify=True):
             pass
 
 
+GUI_EVENT = "<<GuiTask>>"
+
+
 def queue_gui(fn):
+    """Run fn on the Tk thread. Poking Tk with a virtual event means the main
+    loop can sit idle instead of polling a queue several times a second."""
     gui_queue.put(fn)
+    try:
+        root.event_generate(GUI_EVENT, when="tail")
+    except Exception:
+        pass                      # the slow safety-net poll below will catch it
+
+
+def drain_gui_queue(event=None):
+    while True:
+        try:
+            fn = gui_queue.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            fn()
+        except Exception as e:
+            print("gui task error:", e)
 
 
 def poll_queue():
+    """Safety net only — the virtual event does the real work."""
+    drain_gui_queue()
     try:
-        while True:
-            fn = gui_queue.get_nowait()
-            try:
-                fn()
-            except Exception as e:
-                print("gui task error:", e)
-    except queue.Empty:
-        pass
-    root.after(80, poll_queue)
+        root.after(2000, poll_queue)
+    except Exception:
+        pass                      # root destroyed on quit
 
 # --------------------------------------------------------------------------- #
 #  Tray icon
@@ -251,16 +285,7 @@ def make_icon():
     try:
         return Image.open(ICON_PNG).convert("RGBA").resize((64, 64), Image.LANCZOS)
     except Exception:
-        pass
-    # Fallback if icon.png is missing: a simple colour wheel.
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    box = (8, 8, 56, 56)
-    d.pieslice(box, 0, 120, fill=(255, 78, 96))
-    d.pieslice(box, 120, 240, fill=(70, 205, 120))
-    d.pieslice(box, 240, 360, fill=(90, 130, 255))
-    d.ellipse((23, 23, 41, 41), fill=(22, 22, 26, 255))
-    return img
+        return Image.new("RGBA", (64, 64), (118, 185, 0, 255))   # icon.png missing
 
 
 def _apply_action(name):
@@ -704,6 +729,7 @@ def main():
 
     root = ctk.CTk()
     root.withdraw()
+    root.bind(GUI_EVENT, drain_gui_queue)
     ui = SettingsUI(root)
 
     hotkeys = HotkeyManager(apply_profile)
@@ -722,7 +748,7 @@ def main():
     if first_run:
         root.after(400, lambda: queue_gui(show_settings))
 
-    root.after(200, poll_queue)
+    root.after(2000, poll_queue)
     root.mainloop()
 
 
