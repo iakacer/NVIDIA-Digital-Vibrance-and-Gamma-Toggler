@@ -167,7 +167,7 @@ def set_vibrance(percent):
     _init()
     percent = max(0.0, min(100.0, float(percent)))
     applied = _set_vibrance_ex(percent)
-    if applied is None:
+    if not applied:      # missing on this driver, or every display refused it
         applied = _set_vibrance_basic(percent)
     return applied
 
@@ -207,11 +207,48 @@ _gdi32.GetDeviceGammaRamp.restype = ctypes.c_int
 _user32.GetDC.argtypes = [ctypes.c_void_p]
 _user32.GetDC.restype = ctypes.c_void_p
 _user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_gdi32.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p, c_void_p]
+_gdi32.CreateDCW.restype = c_void_p
+_gdi32.DeleteDC.argtypes = [c_void_p]
+_gdi32.DeleteDC.restype = c_int
+
+DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x0001
+DISPLAY_DEVICE_MIRRORING_DRIVER = 0x0008
 
 
-def set_gamma(gamma):
-    """Apply a gamma ramp to the primary display. gamma 1.00 == neutral."""
-    gamma = max(0.30, min(2.80, float(gamma)))
+class DISPLAY_DEVICEW(Structure):
+    _fields_ = [
+        ("cb",           c_uint),
+        ("DeviceName",   ctypes.c_wchar * 32),
+        ("DeviceString", ctypes.c_wchar * 128),
+        ("StateFlags",   c_uint),
+        ("DeviceID",     ctypes.c_wchar * 128),
+        ("DeviceKey",    ctypes.c_wchar * 128),
+    ]
+
+
+_user32.EnumDisplayDevicesW.argtypes = [c_void_p, c_uint, POINTER(DISPLAY_DEVICEW), c_uint]
+_user32.EnumDisplayDevicesW.restype = c_int
+
+
+def _display_names():
+    r"""Device name ('\\.\DISPLAY1', ...) of every display attached to the desktop."""
+    names = []
+    i = 0
+    while True:
+        dd = DISPLAY_DEVICEW()
+        dd.cb = ctypes.sizeof(dd)
+        if not _user32.EnumDisplayDevicesW(None, i, byref(dd), 0):
+            break
+        i += 1
+        if dd.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER:
+            continue
+        if dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP:
+            names.append(dd.DeviceName)
+    return names
+
+
+def _build_ramp(gamma):
     ramp = (ctypes.c_ushort * 256 * 3)()
     inv = 1.0 / gamma
     for i in range(256):
@@ -220,12 +257,35 @@ def set_gamma(gamma):
         ramp[0][i] = v      # R
         ramp[1][i] = v      # G
         ramp[2][i] = v      # B
-    hdc = _user32.GetDC(None)
-    try:
-        ok = _gdi32.SetDeviceGammaRamp(hdc, byref(ramp))
-    finally:
-        _user32.ReleaseDC(None, hdc)
-    return bool(ok)
+    return ramp
+
+
+def set_gamma(gamma):
+    """Apply a gamma ramp to every attached display. gamma 1.00 == neutral.
+
+    Each display gets its own DC: GetDC(NULL) only ever reaches the primary,
+    which on a hybrid/MUX laptop may not even be the adapter currently driving
+    the panel. Returns the number of displays updated."""
+    gamma = max(0.30, min(2.80, float(gamma)))
+    ramp = _build_ramp(gamma)
+    applied = 0
+    for name in _display_names():
+        hdc = _gdi32.CreateDCW("DISPLAY", name, None, None)
+        if not hdc:
+            continue
+        try:
+            if _gdi32.SetDeviceGammaRamp(hdc, byref(ramp)):
+                applied += 1
+        finally:
+            _gdi32.DeleteDC(hdc)
+    if not applied:                 # nothing enumerable — fall back to the primary
+        hdc = _user32.GetDC(None)
+        try:
+            if _gdi32.SetDeviceGammaRamp(hdc, byref(ramp)):
+                applied = 1
+        finally:
+            _user32.ReleaseDC(None, hdc)
+    return applied
 
 
 def get_gamma():

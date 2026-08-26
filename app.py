@@ -127,15 +127,35 @@ def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
+    except FileNotFoundError:
+        data = copy.deepcopy(DEFAULT_CONFIG)
     except Exception:
+        # The file is there but unreadable. Keep it: the next save would
+        # otherwise overwrite it with defaults and the profiles would be gone.
+        try:
+            os.replace(CONFIG_PATH, CONFIG_PATH + ".bad")
+        except OSError:
+            pass
         data = copy.deepcopy(DEFAULT_CONFIG)
     return _ensure_default_profile(data)
 
 
+_save_lock = threading.Lock()
+
+
 def save_config(cfg):
-    os.makedirs(APPDIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    """Write via a temp file + atomic replace. A plain open(..., 'w') truncates
+    first, so a crash or a shutdown mid-write leaves an empty config and every
+    profile is lost. The lock is because hotkey presses save from their own
+    thread while the settings window saves from the Tk thread."""
+    with _save_lock:
+        os.makedirs(APPDIR, exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
 
 
 CONFIG = load_config()
@@ -205,7 +225,9 @@ def apply_values(vibrance, gamma):
     except Exception as e:
         print("vibrance error:", e)
     try:
-        nvcolor.set_gamma(gamma)
+        if not nvcolor.set_gamma(gamma):
+            print(f"gamma error: no display accepted the ramp (gamma {gamma:.2f} "
+                  "may be outside the range Windows allows)")
     except Exception as e:
         print("gamma error:", e)
 
@@ -411,6 +433,8 @@ class SettingsUI:
         self.rows = []
         self.capture_row = None
         self.capture_held = []
+        self.active_idx = 0        # which row is the currently-applied profile
+        self._icon_handles = None
         self._build()
 
     def _build(self):
@@ -477,10 +501,17 @@ class SettingsUI:
         try:
             IMAGE_ICON, LR_LOADFROMFILE = 1, 0x0010
             WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
-            cxs, cys = _user32.GetSystemMetrics(49), _user32.GetSystemMetrics(50)   # small icon
-            cxb, cyb = _user32.GetSystemMetrics(11), _user32.GetSystemMetrics(12)   # large icon
-            h_small = _user32.LoadImageW(None, ICON_ICO, IMAGE_ICON, cxs, cys, LR_LOADFROMFILE)
-            h_big = _user32.LoadImageW(None, ICON_ICO, IMAGE_ICON, cxb, cyb, LR_LOADFROMFILE)
+            if self._icon_handles is None:
+                # Cache the HICONs: this runs on every show_settings() and
+                # LoadImageW handles are never freed, so reloading leaks two
+                # icon handles per open.
+                cxs, cys = _user32.GetSystemMetrics(49), _user32.GetSystemMetrics(50)   # small icon
+                cxb, cyb = _user32.GetSystemMetrics(11), _user32.GetSystemMetrics(12)   # large icon
+                self._icon_handles = (
+                    _user32.LoadImageW(None, ICON_ICO, IMAGE_ICON, cxs, cys, LR_LOADFROMFILE),
+                    _user32.LoadImageW(None, ICON_ICO, IMAGE_ICON, cxb, cyb, LR_LOADFROMFILE),
+                )
+            h_small, h_big = self._icon_handles
             wid = self.root.winfo_id()
             for hwnd in (wid, _user32.GetParent(wid)):
                 if not hwnd:
@@ -495,6 +526,9 @@ class SettingsUI:
     # -- data <-> widgets ------------------------------------------------- #
     def load(self):
         self.profiles = copy.deepcopy(CONFIG["profiles"])
+        names = [p["name"] for p in self.profiles]
+        active = CONFIG["settings"].get("last_profile")
+        self.active_idx = names.index(active) if active in names else 0
         self.var_apply_startup.set(CONFIG["settings"].get("apply_on_startup", True))
         self.var_run_startup.set(is_run_at_startup())
         self.refresh_live()
@@ -577,16 +611,26 @@ class SettingsUI:
 
     # -- actions ---------------------------------------------------------- #
     def add_profile(self):
+        self._cancel_capture()      # _render() is about to invalidate every row widget
         self._commit_widgets()
-        self.profiles.append({"name": f"Profile {len(self.profiles) + 1}",
+        taken = {p["name"] for p in self.profiles}
+        n = len(self.profiles) + 1
+        while f"Profile {n}" in taken:      # a delete can free up the next number
+            n += 1
+        self.profiles.append({"name": f"Profile {n}",
                               "vibrance": 50, "gamma": 1.00, "hotkey": ""})
         self._render()
 
     def delete(self, idx):
         if self.profiles[idx].get("locked"):     # User Default can't be removed
             return
+        self._cancel_capture()      # _render() is about to invalidate every row widget
         self._commit_widgets()
         del self.profiles[idx]
+        if idx < self.active_idx:
+            self.active_idx -= 1
+        elif idx == self.active_idx:
+            self.active_idx = 0              # the applied profile is gone; fall back
         self._render()
 
     def apply_now(self, idx):
@@ -600,6 +644,7 @@ class SettingsUI:
         self.rows[idx]["hk"].configure(text="Click to set")
 
     def save(self):
+        self._cancel_capture()   # else set_bindings() re-registers while still disabled
         self._commit_widgets()
         names = [p["name"] for p in self.profiles]
         if any(not n for n in names):
@@ -623,6 +668,11 @@ class SettingsUI:
 
         CONFIG["profiles"] = copy.deepcopy(self.profiles)
         CONFIG["settings"]["apply_on_startup"] = bool(self.var_apply_startup.get())
+        if 0 <= self.active_idx < len(self.profiles):
+            # Follow a rename. Otherwise _ensure_default_profile() can't find the
+            # old name, resets to User Default, and the tray tick jumps to a
+            # profile whose values aren't actually on screen.
+            CONFIG["settings"]["last_profile"] = self.profiles[self.active_idx]["name"]
         _ensure_default_profile(CONFIG)          # keep User Default pinned & valid
         save_config(CONFIG)
         set_run_at_startup(bool(self.var_run_startup.get()))
@@ -631,9 +681,12 @@ class SettingsUI:
         self._flash("Saved")
 
     # -- hotkey capture --------------------------------------------------- #
-    def begin_capture(self, idx):
+    def _cancel_capture(self):
         if self.capture_row is not None:
             self._end_capture(cancel=True)
+
+    def begin_capture(self, idx):
+        self._cancel_capture()
         self.capture_row = idx
         self.capture_held = []
         self.rows[idx]["hk"].configure(text="Press keys…  (Esc to cancel)")
@@ -697,8 +750,7 @@ class SettingsUI:
         self.root.after(2500, lambda: self.status.configure(text=""))
 
     def hide(self):
-        if self.capture_row is not None:
-            self._end_capture(cancel=True)
+        self._cancel_capture()
         self.root.withdraw()
 
 # --------------------------------------------------------------------------- #
